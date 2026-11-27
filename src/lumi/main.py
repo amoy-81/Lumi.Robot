@@ -195,7 +195,7 @@ def run_app(
     worker_thread = threading.Thread(
         target=_run_worker,
         name="lumi-controller",
-        daemon=False,
+        daemon=True,
     )
 
     face_failed = False

@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+import lumi.main as lumi_main
 from lumi.main import RuntimeConfig, configure_logging, load_runtime_config, main, run_app
 
 
@@ -243,6 +244,49 @@ def test_run_app_handles_keyboard_interrupt_and_face_exception_with_teardown():
     assert crash_code == 1
     assert worker_stopped.is_set()
     assert teardowns == ["kb", "err"]
+    assert not any(t.name.startswith("lumi-") and t.is_alive() for t in threading.enumerate())
+
+
+def test_run_app_stalled_worker_uses_daemon_thread_and_returns_one_after_join_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(lumi_main, "_DEFAULT_JOIN_TIMEOUT_SECONDS", 0.05)
+    worker_started = threading.Event()
+    release_worker = threading.Event()
+    observed_thread: tuple[str, bool] | None = None
+    teardown_called = False
+
+    def stalled_worker(stop_event: threading.Event) -> None:
+        nonlocal observed_thread
+        current = threading.current_thread()
+        observed_thread = (current.name, current.daemon)
+        worker_started.set()
+        release_worker.wait(timeout=5.0)
+
+    def fake_face(request_stop: Callable[[], None]) -> None:
+        assert worker_started.wait(timeout=1.0)
+        request_stop()
+
+    def teardown() -> None:
+        nonlocal teardown_called
+        teardown_called = True
+
+    try:
+        exit_code = run_app(
+            config=RuntimeConfig(),
+            controller_runner=stalled_worker,
+            face_runner=fake_face,
+            teardown=teardown,
+        )
+    finally:
+        release_worker.set()
+        for thread in threading.enumerate():
+            if thread.name == "lumi-controller":
+                thread.join(timeout=1.0)
+
+    assert exit_code == 1
+    assert teardown_called is True
+    assert observed_thread == ("lumi-controller", True)
     assert not any(t.name.startswith("lumi-") and t.is_alive() for t in threading.enumerate())
 
 
