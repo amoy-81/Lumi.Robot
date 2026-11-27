@@ -1,18 +1,24 @@
 """Shared immutable audio buffer contract."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass(frozen=True, slots=True)
 class AudioData:
     """Immutable PCM audio buffer with validated format metadata."""
 
-    samples: bytes
+    samples: bytes = field(repr=False)
     sample_rate: int
     channels: int
     sample_width: int
 
     def __post_init__(self) -> None:
+        if not isinstance(self.samples, bytes):
+            raise TypeError(f"samples must be bytes, got {type(self.samples).__name__}")
+        for field_name in ("sample_rate", "channels", "sample_width"):
+            value = getattr(self, field_name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"{field_name} must be an int, got {value!r}")
         if self.sample_rate <= 0:
             raise ValueError(f"sample_rate must be positive, got {self.sample_rate}")
         if self.channels <= 0:

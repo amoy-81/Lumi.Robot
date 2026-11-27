@@ -198,14 +198,14 @@ def run_app(
         daemon=True,
     )
 
-    face_failed = False
+    had_error = False
     worker_thread.start()
     try:
         face_runner(stop_event.set)
     except KeyboardInterrupt:
         logger.info("Shutdown requested via KeyboardInterrupt")
     except Exception:
-        face_failed = True
+        had_error = True
         logger.exception("Face runner exited with an unhandled error")
     finally:
         stop_event.set()
@@ -220,10 +220,10 @@ def run_app(
             try:
                 teardown()
             except Exception:
-                face_failed = True
+                had_error = True
                 logger.exception("Teardown callback raised an unhandled error")
 
-    if worker_errors or face_failed or worker_thread.is_alive():
+    if worker_errors or had_error or worker_thread.is_alive():
         return 1
     return 0
 

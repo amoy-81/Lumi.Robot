@@ -2,7 +2,7 @@ import logging
 import os
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 
@@ -10,6 +10,21 @@ import pytest
 
 import lumi.main as lumi_main
 from lumi.main import RuntimeConfig, configure_logging, load_runtime_config, main, run_app
+
+
+@pytest.fixture
+def isolated_lumi_logger() -> Iterator[logging.Logger]:
+    lumi_logger = logging.getLogger("lumi")
+    original_handlers = list(lumi_logger.handlers)
+    original_level = lumi_logger.level
+    try:
+        yield lumi_logger
+    finally:
+        for handler in lumi_logger.handlers:
+            if handler not in original_handlers:
+                handler.close()
+        lumi_logger.handlers[:] = original_handlers
+        lumi_logger.setLevel(original_level)
 
 
 def _clear_lumi_env(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -135,27 +150,22 @@ def test_runtime_config_is_frozen_and_validates_direct_instantiation():
             RuntimeConfig(**invalid_kwargs)  # type: ignore[arg-type]
 
 
-def test_configure_logging_avoids_duplicate_handlers_and_validates_level():
-    lumi_logger = logging.getLogger("lumi")
-    original_handlers = list(lumi_logger.handlers)
-    original_level = lumi_logger.level
-    lumi_logger.handlers.clear()
-    try:
-        logger = configure_logging("INFO")
-        assert logger is lumi_logger
-        assert logger.level == logging.INFO
-        assert len(logger.handlers) == 1
+def test_configure_logging_avoids_duplicate_handlers_and_validates_level(
+    isolated_lumi_logger: logging.Logger,
+):
+    isolated_lumi_logger.handlers.clear()
+    logger = configure_logging("INFO")
+    assert logger is isolated_lumi_logger
+    assert logger.level == logging.INFO
+    assert len(logger.handlers) == 1
 
-        logger_again = configure_logging("debug")
-        assert logger_again is lumi_logger
-        assert logger_again.level == logging.DEBUG
-        assert len(logger_again.handlers) == 1
+    logger_again = configure_logging("debug")
+    assert logger_again is isolated_lumi_logger
+    assert logger_again.level == logging.DEBUG
+    assert len(logger_again.handlers) == 1
 
-        with pytest.raises(ValueError):
-            configure_logging("VERBOSE")
-    finally:
-        lumi_logger.handlers[:] = original_handlers
-        lumi_logger.setLevel(original_level)
+    with pytest.raises(ValueError):
+        configure_logging("VERBOSE")
 
 
 def test_run_app_joins_worker_thread_and_runs_teardown_on_worker_error():
@@ -290,7 +300,41 @@ def test_run_app_stalled_worker_uses_daemon_thread_and_returns_one_after_join_ti
     assert not any(t.name.startswith("lumi-") and t.is_alive() for t in threading.enumerate())
 
 
-def test_main_check_config_flag_exits_zero(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_run_app_catches_logs_and_fails_on_teardown_exception(
+    caplog: pytest.LogCaptureFixture,
+):
+    worker_stopped = threading.Event()
+
+    def worker(stop_event: threading.Event) -> None:
+        stop_event.wait(timeout=2.0)
+        worker_stopped.set()
+
+    def fake_face(request_stop: Callable[[], None]) -> None:
+        request_stop()
+
+    def failing_teardown() -> None:
+        raise RuntimeError("teardown-boom")
+
+    with caplog.at_level(logging.ERROR, logger="lumi"):
+        exit_code = run_app(
+            config=RuntimeConfig(),
+            controller_runner=worker,
+            face_runner=fake_face,
+            teardown=failing_teardown,
+        )
+
+    assert exit_code == 1
+    assert worker_stopped.is_set()
+    assert "Teardown callback raised an unhandled error" in caplog.text
+    assert "teardown-boom" in caplog.text
+    assert not any(t.name.startswith("lumi-") and t.is_alive() for t in threading.enumerate())
+
+
+def test_main_check_config_flag_exits_zero(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    isolated_lumi_logger: logging.Logger,
+):
     _clear_lumi_env(monkeypatch)
     monkeypatch.chdir(tmp_path)
     assert main(["--check-config"]) == 0
@@ -301,23 +345,17 @@ def test_main_check_config_logs_safe_summary_and_rejects_invalid_config(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
     capsys: pytest.CaptureFixture[str],
+    isolated_lumi_logger: logging.Logger,
 ):
     _clear_lumi_env(monkeypatch)
     monkeypatch.chdir(tmp_path)
-    lumi_logger = logging.getLogger("lumi")
-    original_handlers = list(lumi_logger.handlers)
-    original_level = lumi_logger.level
-    try:
-        with caplog.at_level(logging.INFO, logger="lumi"):
-            assert main(["--check-config"]) == 0
-        assert "auto_vad" in caplog.text
-        assert "predefined" in caplog.text
-        assert "480x320" in caplog.text
+    with caplog.at_level(logging.INFO, logger="lumi"):
+        assert main(["--check-config"]) == 0
+    assert "auto_vad" in caplog.text
+    assert "predefined" in caplog.text
+    assert "480x320" in caplog.text
 
-        monkeypatch.setenv("LUMI_FACE_WIDTH", "not-an-int")
-        assert main(["--check-config"]) == 1
-        captured = capsys.readouterr()
-        assert "LUMI_FACE_WIDTH" in captured.err
-    finally:
-        lumi_logger.handlers[:] = original_handlers
-        lumi_logger.setLevel(original_level)
+    monkeypatch.setenv("LUMI_FACE_WIDTH", "not-an-int")
+    assert main(["--check-config"]) == 1
+    captured = capsys.readouterr()
+    assert "LUMI_FACE_WIDTH" in captured.err
